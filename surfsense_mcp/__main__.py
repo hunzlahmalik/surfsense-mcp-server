@@ -68,8 +68,13 @@ def main() -> None:
         raise ValueError("SURFSENSE_BASE_URL is not set")
 
     if server_mode == ServerMode.STDIO:
-        if not os.getenv("SURFSENSE_JWT"):
-            raise ValueError("SURFSENSE_JWT is not set (required for stdio mode)")
+        has_jwt = bool(os.getenv("SURFSENSE_JWT"))
+        has_password_creds = bool(os.getenv("SURFSENSE_EMAIL")) and bool(os.getenv("SURFSENSE_PASSWORD"))
+        if not has_jwt and not has_password_creds:
+            raise ValueError(
+                "stdio mode requires SURFSENSE_JWT, or both SURFSENSE_EMAIL "
+                "and SURFSENSE_PASSWORD for the password-login fallback."
+            )
         get_stdio_mcp().run()
         return
 

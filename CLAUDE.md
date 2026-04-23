@@ -2,9 +2,9 @@
 
 ## What this package is
 
-A read-only [FastMCP v3](https://gofastmcp.com) server that wraps SurfSense's existing `GET` endpoints and exposes them as MCP tools. It is a sibling to `plane-mcp-server/` and follows the same structure.
+A [FastMCP v3](https://gofastmcp.com) server that exposes SurfSense as MCP tools (read + write + streaming chat). It is a sibling to `plane-mcp-server/` and follows the same structure.
 
-No backend changes to SurfSense are required or allowed — all tools call existing `surfsense_backend` HTTP routes.
+**No backend changes to SurfSense are allowed** — all tools call existing `surfsense_backend` HTTP routes. Tools may use any HTTP verb the route supports (GET/POST/PUT/DELETE).
 
 ## Package layout
 
@@ -24,9 +24,12 @@ surfsense-mcp-server/
 │   │   └── surfsense_header_auth_provider.py  # TokenVerifier — validates JWT via GET /users/me
 │   └── tools/
 │       ├── __init__.py                    # register_tools(mcp) — calls all per-module register fns
-│       ├── search_spaces.py               # list_search_spaces
-│       ├── documents.py                   # search_documents, get_document, get_recent_documents
-│       └── threads.py                     # list_research_threads, get_research_thread
+│       ├── search_spaces.py               # list / get / create / update / delete
+│       ├── documents.py                   # list / search / get / upload / update / delete / status / type_counts
+│       ├── threads.py                     # list / get / delete / history + query (SSE streaming)
+│       ├── reports.py                     # list / get / export / delete
+│       ├── notes.py                       # create
+│       └── logs.py                        # get
 └── tests/
     ├── conftest.py                        # mock_transport fixture, FAKE_JWT, json_response
     └── test_tools.py                      # 7 smoke tests — URL, query string, auth header, 401
@@ -49,8 +52,13 @@ ruff format surfsense_mcp/
 # Upgrade fastmcp to latest v3
 uv sync --extra dev --upgrade-package fastmcp
 
-# Run stdio locally
+# Run stdio locally (JWT paste)
 SURFSENSE_BASE_URL=http://localhost:8000 SURFSENSE_JWT=<jwt> python -m surfsense_mcp stdio
+
+# Run stdio with password fallback (no JWT paste)
+SURFSENSE_BASE_URL=http://localhost:8000 \
+SURFSENSE_EMAIL=admin@example.com SURFSENSE_PASSWORD=<pw> \
+python -m surfsense_mcp stdio
 
 # Run HTTP mode
 SURFSENSE_BASE_URL=http://localhost:8000 python -m surfsense_mcp http   # binds :8211
@@ -65,12 +73,13 @@ SURFSENSE_BASE_URL=http://localhost:8000 python -m surfsense_mcp http   # binds 
 
 ### Auth model
 
-SurfSense has no API-key concept — only short-lived JWTs from `fastapi-users`. The server does not refresh tokens. When a JWT expires, the user re-pastes a fresh one.
+SurfSense issues short-lived JWTs from `fastapi-users` (no API-key concept). Two input paths are supported; the stdio password fallback is optional.
 
-- **stdio**: JWT from `SURFSENSE_JWT` env var.
-- **http**: JWT from `Authorization: Bearer` request header; validated by calling `GET {SURFSENSE_BASE_URL}/users/me`.
+- **stdio (primary):** JWT from `SURFSENSE_JWT` env var — user pastes a fresh one when it expires. No refresh.
+- **stdio (optional fallback):** if `SURFSENSE_JWT` is unset and `SURFSENSE_EMAIL` + `SURFSENSE_PASSWORD` are set, the client calls `POST /auth/jwt/login`, caches the token for `TOKEN_TTL` seconds (default 3300 = 55 min), and auto-re-authenticates once on 401. Intended for CI / long-running stdio sessions.
+- **http:** JWT from `Authorization: Bearer` request header; validated by `SurfSenseHeaderAuthProvider` calling `GET /users/me`. Password fallback is **not** enabled in HTTP mode — the Bearer identity must come from the caller.
 
-`get_surfsense_client_context()` in `client.py` handles both: it tries `get_access_token()` (FastMCP's request-scoped token) first, falls back to `SURFSENSE_JWT` env.
+`get_surfsense_client_context()` in `client.py` resolves the token in this order: FastMCP request-scoped `get_access_token()` → `SURFSENSE_JWT` env → password login (if creds present). On 401 in password mode only, re-authenticate once and retry; otherwise raise.
 
 ### Tool conventions
 
@@ -78,6 +87,10 @@ SurfSense has no API-key concept — only short-lived JWTs from `fastapi-users`.
 - Tools return raw `dict` / `list` — no Pydantic re-modeling of SurfSense's response schemas.
 - Tools `raise` on non-2xx responses so FastMCP surfaces errors to the MCP client.
 - All tools open and close `httpx.AsyncClient` within the call using an `async with` block (client is not shared across calls).
+- Write tools (POST/PUT/DELETE) are allowed. Follow SurfSense's existing request schemas — do **not** introduce new fields.
+- Chat/query tools consume SSE from `POST /api/v1/new_chat` via `httpx.AsyncClient.stream(...)`. Parse `text-delta` events (and the documented control events: `start`, `start-step`, `finish`, `finish-step`, `text-start`, `text-end`, `data-thinking-step`, `data-thread-title-update`) into a single concatenated string; fall back to raw JSON / raw text when the event shape is unknown. See DocuMentor's `_query_surfsense` for the reference event taxonomy.
+- Tools that create a thread on demand (when `thread_id` is `None`) must `POST /api/v1/threads` first, then stream, and return the new `thread_id` so callers can continue the conversation.
+- Binary/export responses (e.g. `GET /api/v1/reports/{id}/export`) return content-type + size, not inline bytes.
 
 ### FastMCP version
 
@@ -96,10 +109,11 @@ app = header_mcp.http_app(middleware=cors)  # different signature
 
 ## Key constraints
 
-- **No backend changes** — all tools must call existing `GET` endpoints. Do not add routes to `surfsense_backend`.
-- **Read-only** — no `POST`, `PUT`, `DELETE` tools.
-- **No resources** — tools only; MCP resources are not exposed.
-- **No Pydantic schemas** — return raw dicts from httpx responses; SurfSense's schemas are not imported here.
+- **No backend changes** — all tools must call routes that already exist in `surfsense_backend`. Verify in `surfsense_backend/app/routes/` before adding any tool. If a route is missing, drop the tool — do not add one to the backend.
+- **No new MCP resources** — tools only.
+- **No Pydantic re-modeling** — return raw dicts from httpx responses. SurfSense's schemas are not imported here.
+- **No token refresh in JWT-paste mode** — the server does not attempt to refresh `SURFSENSE_JWT`. Expiry surfaces to the MCP client as a 401. Password-fallback mode is the only path with auto-reauth.
+- **HTTP mode never uses password login** — only stdio is allowed to log in with email/password, to keep the Bearer-validated HTTP surface identity-bound to the caller.
 
 ## Relevant SurfSense backend files
 
@@ -107,12 +121,17 @@ When adding tools, check these backend files to confirm route paths and query pa
 
 | Backend file | What it defines |
 |---|---|
-| `surfsense_backend/app/routes/search_space_routes.py` | `/api/v1/searchspaces` — `owned_only`, `skip`, `limit` |
-| `surfsense_backend/app/routes/documents_routes.py` | `/api/v1/documents`, `/api/v1/documents/search`, `/api/v1/documents/{id}` |
-| `surfsense_backend/app/routes/threads_routes.py` | `/api/v1/threads`, `/api/v1/threads/{id}` |
-| `surfsense_backend/app/routes/auth_routes.py` | `/users/me` (used by the auth provider) |
+| `surfsense_backend/app/routes/search_space_routes.py` | `/api/v1/searchspaces` (list/get/create/update/delete) — list supports `owned_only`, `skip`, `limit` |
+| `surfsense_backend/app/routes/documents_routes.py` | `/api/v1/documents`, `/documents/search`, `/documents/{id}` (GET/PUT/DELETE), `/documents/fileupload`, `/documents/status`, `/documents/type-counts` |
+| `surfsense_backend/app/routes/threads_routes.py` | `/api/v1/threads`, `/threads/{id}`, `/threads/{id}/messages`, `POST /api/v1/new_chat` (SSE stream) |
+| `surfsense_backend/app/routes/reports_routes.py` | `/api/v1/reports`, `/reports/{id}/content`, `/reports/{id}/export` |
+| `surfsense_backend/app/routes/logs_routes.py` | `/api/v1/logs` |
+| `surfsense_backend/app/routes/notes_routes.py` | `POST /api/v1/search-spaces/{id}/notes` |
+| `surfsense_backend/app/routes/auth_routes.py` | `/users/me`, `POST /auth/jwt/login` |
 
 > `sort_column_map` in `documents_routes.py` only accepts `"created_at"`, `"title"`, `"document_type"` — `"updated_at"` is not a valid sort key.
+>
+> Confirm each route's existence and exact path before implementing a tool — DocuMentor (the reference port source) targets a different SurfSense fork and some paths may not match this fork. If a route is missing, drop the tool (no backend additions).
 
 ## Test fixtures
 

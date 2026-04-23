@@ -14,9 +14,17 @@ FAKE_JWT = "test-jwt-token"
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Set the env vars the client layer requires."""
+    """Set the env vars the client layer requires and reset auth caches."""
     monkeypatch.setenv("SURFSENSE_BASE_URL", FAKE_BASE_URL)
     monkeypatch.setenv("SURFSENSE_JWT", FAKE_JWT)
+    # Make sure no leftover email/password creds from a prior test leak in.
+    monkeypatch.delenv("SURFSENSE_EMAIL", raising=False)
+    monkeypatch.delenv("SURFSENSE_PASSWORD", raising=False)
+    monkeypatch.delenv("TOKEN_TTL", raising=False)
+    # Reset the password-token cache so tests are independent.
+    from surfsense_mcp import client as _client_module
+
+    _client_module.invalidate_password_token()
 
 
 @pytest.fixture
